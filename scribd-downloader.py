@@ -14,6 +14,7 @@ Key behaviors:
    stream-based PDF transfer for large documents.
 """
 
+import argparse
 import base64
 import os
 import re
@@ -1238,27 +1239,233 @@ def save_pdf_pages_individually(
 
     return os.path.abspath(filename)
 
+def is_issuu_url(url):
+    """Check if the given URL is an Issuu document link."""
+    return bool(re.search(r"(?:issuu\.com|isu\.pub)", url, re.IGNORECASE))
+
+
+def parse_issuu_url(url):
+    """
+    Extract username and document slug from Issuu URL.
+    Example: https://issuu.com/bomvarela/docs/bomweb10_2024
+    """
+    match = re.search(r"issuu\.com/([^/]+)/docs/([^/?#]+)", url, re.IGNORECASE)
+    if match:
+        return match.group(1), match.group(2)
+    return None, None
+
+
+def parse_page_range(range_str, total_pages):
+    """
+    Parse a page range string like '225,226', '225-226', '1-5, 8, 10-12', or 'all'.
+    Returns a sorted list of unique 1-based page numbers within [1, total_pages].
+    """
+    if not range_str or range_str.strip().lower() in ("all", "*", ""):
+        return list(range(1, total_pages + 1))
+
+    selected = set()
+    parts = range_str.split(",")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            bounds = part.split("-", 1)
+            try:
+                start = int(bounds[0].strip())
+                end = int(bounds[1].strip())
+                for p in range(min(start, end), max(start, end) + 1):
+                    if 1 <= p <= total_pages:
+                        selected.add(p)
+            except ValueError:
+                continue
+        else:
+            try:
+                p = int(part)
+                if 1 <= p <= total_pages:
+                    selected.add(p)
+            except ValueError:
+                continue
+
+    return sorted(selected)
+
+
+def download_issuu_document(url, page_range_str=None, output_filename=None):
+    """
+    Download specified pages from an Issuu publication and merge into a single PDF.
+    """
+    import io
+    import requests
+    from PIL import Image
+    from pypdf import PdfWriter
+
+    username, slug = parse_issuu_url(url)
+    if not username or not slug:
+        raise RuntimeError(
+            f"Invalid Issuu URL: {url}\n"
+            "Expected format: https://issuu.com/<username>/docs/<document-name>"
+        )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    print(f"\nFetching Issuu document metadata for '{slug}' by '{username}'...")
+    reader_url = f"https://reader3.isu.pub/{username}/{slug}/reader3_4.json"
+
+    page_image_urls = {}
+    total_pages = 0
+
+    try:
+        resp = requests.get(reader_url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            doc_data = resp.json().get("document", {})
+            pages_list = doc_data.get("pages", [])
+            total_pages = len(pages_list)
+            for idx, p_info in enumerate(pages_list):
+                page_num = idx + 1
+                uri = p_info.get("imageUri", "")
+                if uri:
+                    if not uri.startswith("http"):
+                        uri = f"https://{uri}"
+                    page_image_urls[page_num] = uri
+    except Exception as e:
+        print(f"Warning: reader API lookup failed ({e}), attempting fallback...")
+
+    if not page_image_urls:
+        html_resp = requests.get(url, headers=headers, timeout=30)
+        if html_resp.status_code != 200:
+            raise RuntimeError(f"Failed to access Issuu page (HTTP {html_resp.status_code})")
+
+        match = re.search(r'https?://image\.isu\.pub/([a-zA-Z0-9_-]+)/jpg/page_1', html_resp.text)
+        if not match:
+            match = re.search(r'publicationId["\':\s]+([a-zA-Z0-9_-]+)', html_resp.text)
+        if not match:
+            raise RuntimeError("Could not locate publication identifier for this Issuu document.")
+
+        pub_id = match.group(1)
+        count_match = re.search(r'pageCount["\':\s]+(\d+)', html_resp.text)
+        total_pages = int(count_match.group(1)) if count_match else 1
+        page_image_urls = {
+            i: f"https://image.isu.pub/{pub_id}/jpg/page_{i}.jpg"
+            for i in range(1, total_pages + 1)
+        }
+
+    print(f"Total pages in publication: {total_pages}")
+
+    selected_pages = parse_page_range(page_range_str, total_pages)
+    if not selected_pages:
+        raise RuntimeError("No valid pages selected for download.")
+
+    if not output_filename:
+        if len(selected_pages) == total_pages:
+            output_filename = f"{slug}.pdf"
+        elif len(selected_pages) == 1:
+            output_filename = f"{slug}_pagina_{selected_pages[0]}.pdf"
+        elif selected_pages == list(range(selected_pages[0], selected_pages[-1] + 1)):
+            output_filename = f"{slug}_paginas_{selected_pages[0]}-{selected_pages[-1]}.pdf"
+        else:
+            output_filename = f"{slug}_paginas_seleccionadas.pdf"
+
+    print(f"Exporting {len(selected_pages)} page(s) to: {output_filename}")
+    print(f"Selected pages: {selected_pages}")
+
+    with tempfile.TemporaryDirectory(prefix="issuu-pdf-pages-") as spool_dir:
+        spooled_pdfs = []
+        for p in selected_pages:
+            img_url = page_image_urls.get(p)
+            print(f"  Downloading page {p}/{total_pages} from {img_url}...")
+            img_resp = requests.get(img_url, headers=headers, timeout=60)
+            if img_resp.status_code != 200:
+                raise RuntimeError(f"Failed to download image for page {p} (HTTP {img_resp.status_code})")
+
+            img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+            page_pdf_path = os.path.join(spool_dir, f"page_{p:06d}.pdf")
+            img.save(page_pdf_path, "PDF", resolution=300.0)
+            img.close()
+            spooled_pdfs.append(page_pdf_path)
+
+        print(f"Merging {len(spooled_pdfs)} disk-spooled pages into final PDF...")
+        writer = PdfWriter()
+        for pdf_path in spooled_pdfs:
+            writer.append(pdf_path)
+
+        with open(output_filename, "wb") as f_out:
+            writer.write(f_out)
+        writer.close()
+
+    abs_path = os.path.abspath(output_filename)
+    print(f"\nPDF saved successfully to: {abs_path}")
+    return abs_path
+
+
 def main():
-    """Run the exporter interactively."""
-    input_url = input("Input link Scribd: ").strip()
+    """Run the exporter interactively or via CLI arguments."""
+    parser = argparse.ArgumentParser(
+        description="Download Scribd and Issuu documents as PDF."
+    )
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="URL of the Scribd or Issuu document.",
+    )
+    parser.add_argument(
+        "--pages",
+        "-p",
+        default=None,
+        help="Page range to download (e.g. '225-226', '1-10', 'all'). Currently supported for Issuu.",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Custom output PDF filename.",
+    )
+
+    args = parser.parse_args()
+
+    input_url = args.url
+    if not input_url:
+        input_url = input("Input link (Scribd or Issuu): ").strip()
+
+    if not input_url:
+        print("Error: No URL provided.")
+        raise SystemExit(1)
+
+    if is_issuu_url(input_url):
+        page_range = args.pages
+        if not page_range:
+            page_range = input(
+                "Input page range (e.g. 225-226, 1-10, or Enter for all): "
+            ).strip()
+        download_issuu_document(
+            input_url,
+            page_range_str=page_range,
+            output_filename=args.output,
+        )
+        return
 
     converted_url = convert_scribd_link(input_url)
-    pdf_filename = get_filename_from_url(input_url)
+    pdf_filename = args.output or get_filename_from_url(input_url)
 
     print(f"Link embed: {converted_url}")
     print(f"Output filename: {pdf_filename}")
 
     if converted_url == "Invalid Scribd URL":
-        print("Error: Please provide a valid Scribd document URL")
+        print("Error: Please provide a valid Scribd or Issuu document URL")
         print(
-            "Example: "
+            "Example Scribd: "
             "https://www.scribd.com/document/"
             "123456789/Document-Title"
         )
         print(
-            "Example: "
-            "https://www.scribd.com/doc/"
-            "123456789/Document-Title"
+            "Example Issuu:  "
+            "https://issuu.com/username/docs/document-name"
         )
         raise SystemExit(1)
 
